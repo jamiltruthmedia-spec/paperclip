@@ -134,6 +134,28 @@ export const queryKeys = {
   skills: {
     available: ["skills", "available"] as const,
   },
+  agentMemories: {
+    list: (agentId: string) => ["agent-memories", agentId] as const,
+    listByScope: (agentId: string, scope: string) => ["agent-memories", agentId, scope] as const,
+  },
+  mcpServers: {
+    list: (companyId: string) => ["mcp-servers", companyId] as const,
+  },
+  agentKpis: {
+    list: (agentId: string) => ["agent-kpis", agentId] as const,
+    trends: (agentId: string) => ["agent-kpis", agentId, "trends"] as const,
+  },
+  companyAnalytics: (companyId: string) => ["company-analytics", companyId] as const,
+  observations: {
+    list: (companyId: string) => ["observations", companyId] as const,
+  },
+  experiments: {
+    list: (agentId: string) => ["experiments", agentId] as const,
+  },
+  skillChanges: {
+    forSkill: (companyId: string, skillId: string) => ["skill-changes", companyId, skillId] as const,
+    forAgent: (agentId: string) => ["skill-changes", "agent", agentId] as const,
+  },
   plugins: {
     all: ["plugins"] as const,
     examples: ["plugins", "examples"] as const,

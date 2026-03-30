@@ -2136,9 +2136,20 @@ export function heartbeatService(db: Db) {
     const taskSession = taskKey
       ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, taskKey)
       : null;
+    // V2: Per-project session — use project session as primary if available
+    let v2ProjectSession: { sessionParamsJson: Record<string, unknown> | null; sessionDisplayId: string | null } | null = null;
+    if (executionProjectId) {
+      try {
+        const { sessionResolverService } = await import("./agent-runtime/session-resolver.js");
+        const sessionResolver = sessionResolverService(db);
+        v2ProjectSession = await sessionResolver.resolveSession(agent.id, agent.adapterType, executionProjectId);
+      } catch (err) {
+        logger.warn({ err, agentId: agent.id }, "V2: failed to resolve project session, falling back to task session");
+      }
+    }
     const resetTaskSession = shouldResetTaskSessionForWake(context);
     const sessionResetReason = describeSessionResetReason(context);
-    const taskSessionForRun = resetTaskSession ? null : taskSession;
+    const taskSessionForRun = resetTaskSession ? null : (v2ProjectSession ?? taskSession);
     const explicitResumeSessionParams = normalizeSessionParams(
       sessionCodec.deserialize(parseObject(context.resumeSessionParams)),
     );
@@ -2663,6 +2674,63 @@ export function heartbeatService(db: Db) {
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
       }
+      // V2: Load agent memories and inject as system prompt appendix
+      let memoryCleanup: (() => void) | null = null;
+      try {
+        const { memoryLoaderService } = await import("./agent-runtime/memory-loader.js");
+        const memoryLoader = memoryLoaderService(db);
+        const memories = await memoryLoader.loadMemories(agent.id, executionProjectId ?? undefined);
+        if (memories.length > 0) {
+          const os = await import("node:os");
+          const fsSync = await import("node:fs");
+          const pathMod = await import("node:path");
+          const tempDir = fsSync.mkdtempSync(pathMod.join(os.tmpdir(), "paperclip-memory-"));
+          const memoryMd = memories.map((m) =>
+            `## ${m.title}\n**Category:** ${m.category} | **Source:** ${m.source} | **Scope:** ${m.scope}\n\n${m.content}`
+          ).join("\n\n---\n\n");
+          const memoryContent = `# Agent Memory\n\nThese are your accumulated memories and learnings. Use them to inform your work.\n\n${memoryMd}`;
+          const memoryPath = pathMod.join(tempDir, "agent-memory.md");
+          fsSync.writeFileSync(memoryPath, memoryContent);
+          context.paperclipMemoryFilePath = memoryPath;
+          logger.info(
+            { agentId: agent.id, runId: run.id, memoryCount: memories.length },
+            "V2: injecting agent memories into run",
+          );
+          memoryCleanup = () => {
+            try { fsSync.rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
+          };
+        }
+      } catch (memErr) {
+        logger.warn({ err: memErr, agentId: agent.id, runId: run.id }, "V2: failed to load agent memories");
+      }
+
+      // V2: Resolve MCP servers for this agent and inject config path into context
+      let mcpConfigCleanup: (() => void) | null = null;
+      try {
+        const { mcpResolverService } = await import("./agent-runtime/mcp-resolver.js");
+        const mcpResolver = mcpResolverService(db);
+        const mcpServers = await mcpResolver.resolveMcpConfig(agent.id, agent.companyId);
+        if (mcpServers.length > 0) {
+          const os = await import("node:os");
+          const fs = await import("node:fs");
+          const path = await import("node:path");
+          const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-mcp-"));
+          const configPath = await mcpResolver.writeMcpConfigFile(mcpServers, tempDir);
+          context.paperclipMcpConfigPath = configPath;
+          logger.info(
+            { agentId: agent.id, runId: run.id, mcpServerCount: mcpServers.length, configPath },
+            "V2: injecting MCP config into agent run",
+          );
+          mcpConfigCleanup = () => {
+            try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
+          };
+        } else {
+          logger.info({ agentId: agent.id, runId: run.id }, "V2: no MCP servers resolved for agent");
+        }
+      } catch (mcpErr) {
+        logger.warn({ err: mcpErr, agentId: agent.id, runId: run.id }, "Failed to resolve MCP config for agent run");
+      }
+
       const adapterResult = await adapter.execute({
         runId: run.id,
         agent,
@@ -2676,6 +2744,10 @@ export function heartbeatService(db: Db) {
         },
         authToken: authToken ?? undefined,
       });
+
+      // Clean up temp files
+      if (mcpConfigCleanup) mcpConfigCleanup();
+      if (memoryCleanup) memoryCleanup();
       const adapterManagedRuntimeServices = adapterResult.runtimeServices
         ? await persistAdapterManagedRuntimeServices({
             db,
@@ -2863,6 +2935,44 @@ export function heartbeatService(db: Db) {
               lastError: outcome === "succeeded" ? null : (adapterResult.errorMessage ?? "run_failed"),
             });
           }
+        }
+        // V2: Also persist to project session
+        if (executionProjectId && nextSessionState.params) {
+          try {
+            const { sessionResolverService } = await import("./agent-runtime/session-resolver.js");
+            const sessionResolver = sessionResolverService(db);
+            await sessionResolver.updateSession(agent.id, agent.adapterType, executionProjectId, {
+              sessionParamsJson: nextSessionState.params,
+              sessionDisplayId: nextSessionState.displayId,
+              lastRunId: finalizedRun.id,
+              runCount: 1,
+              inputTokens: normalizedUsage?.inputTokens ?? 0,
+              outputTokens: normalizedUsage?.outputTokens ?? 0,
+            });
+          } catch (err) {
+            logger.warn({ err, agentId: agent.id, runId: run.id }, "V2: failed to persist project session");
+          }
+        }
+        // V2: Post-run KPI recording
+        try {
+          const { postRunEvalService } = await import("./agent-runtime/post-run-eval.js");
+          const postRunEval = postRunEvalService(db);
+          const startedAt = run.startedAt ?? new Date();
+          const finishedAt = new Date();
+          await postRunEval.recordKpis({
+            agentId: agent.id,
+            companyId: agent.companyId,
+            projectId: executionProjectId ?? null,
+            runId: run.id,
+            taskCompleted: outcome === "succeeded",
+            tokensUsed: (normalizedUsage?.inputTokens ?? 0) + (normalizedUsage?.outputTokens ?? 0),
+            costCents: adapterResult.costUsd != null ? Math.round(adapterResult.costUsd * 100) : null,
+            durationSeconds: Math.round((finishedAt.getTime() - startedAt.getTime()) / 1000),
+            errorsEncountered: outcome === "failed" ? 1 : 0,
+          });
+          logger.info({ agentId: agent.id, runId: run.id, outcome }, "V2: recorded post-run KPIs");
+        } catch (err) {
+          logger.warn({ err, agentId: agent.id, runId: run.id }, "V2: failed to record post-run KPIs");
         }
       }
       await finalizeAgentStatus(agent.id, outcome);

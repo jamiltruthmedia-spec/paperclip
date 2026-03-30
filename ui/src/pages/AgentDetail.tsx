@@ -23,6 +23,9 @@ import { useDialog } from "../context/DialogContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
 import { AgentConfigForm } from "../components/AgentConfigForm";
+import { AgentMemoryTab } from "../components/AgentMemoryTab";
+import { AgentPerformanceTab } from "../components/AgentPerformanceTab";
+import { AgentMcpTab } from "../components/AgentMcpTab";
 import { PageTabBar } from "../components/PageTabBar";
 import { adapterLabels, roleLabels, help } from "../components/agent-config-primitives";
 import { MarkdownEditor } from "../components/MarkdownEditor";
@@ -222,13 +225,16 @@ function scrollToContainerBottom(container: ScrollContainer, behavior: ScrollBeh
   container.scrollTo({ top: container.scrollHeight, behavior });
 }
 
-type AgentDetailView = "dashboard" | "instructions" | "configuration" | "skills" | "runs" | "budget";
+type AgentDetailView = "dashboard" | "instructions" | "configuration" | "skills" | "runs" | "budget" | "memory" | "performance" | "mcps";
 
 function parseAgentDetailView(value: string | null): AgentDetailView {
   if (value === "instructions" || value === "prompts") return "instructions";
   if (value === "configure" || value === "configuration") return "configuration";
   if (value === "skills") return "skills";
   if (value === "budget") return "budget";
+  if (value === "memory") return "memory";
+  if (value === "performance") return "performance";
+  if (value === "mcps") return "mcps";
   if (value === "runs") return value;
   return "dashboard";
 }
@@ -651,7 +657,13 @@ export function AgentDetail() {
               ? "runs"
               : activeView === "budget"
                 ? "budget"
-              : "dashboard";
+                : activeView === "memory"
+                  ? "memory"
+                  : activeView === "performance"
+                    ? "performance"
+                    : activeView === "mcps"
+                      ? "mcps"
+                      : "dashboard";
     if (routeAgentRef !== canonicalAgentRef || urlTab !== canonicalTab) {
       navigate(`/agents/${canonicalAgentRef}/${canonicalTab}`, { replace: true });
       return;
@@ -913,6 +925,9 @@ export function AgentDetail() {
               { value: "skills", label: "Skills" },
               { value: "configuration", label: "Configuration" },
               { value: "runs", label: "Runs" },
+              { value: "memory", label: "Memory" },
+              { value: "performance", label: "Performance" },
+              { value: "mcps", label: "MCPs" },
               { value: "budget", label: "Budget" },
             ]}
             value={activeView}
@@ -1035,6 +1050,22 @@ export function AgentDetail() {
           agentRouteId={canonicalAgentRef}
           selectedRunId={urlRunId ?? null}
           adapterType={agent.adapterType}
+        />
+      )}
+
+      {activeView === "memory" && resolvedCompanyId && (
+        <AgentMemoryTab agentId={agent.id} companyId={resolvedCompanyId} />
+      )}
+
+      {activeView === "performance" && resolvedCompanyId && (
+        <AgentPerformanceTab agentId={agent.id} companyId={resolvedCompanyId} />
+      )}
+
+      {activeView === "mcps" && resolvedCompanyId && companyPrefix && (
+        <AgentMcpTab
+          agentId={agent.id}
+          companyId={resolvedCompanyId}
+          companyPrefix={companyPrefix}
         />
       )}
 
@@ -2369,7 +2400,7 @@ function AgentSkillsTab({
   const queryClient = useQueryClient();
   const [skillDraft, setSkillDraft] = useState<string[]>([]);
   const [lastSavedSkills, setLastSavedSkills] = useState<string[]>([]);
-  const [unmanagedOpen, setUnmanagedOpen] = useState(false);
+  const [unmanagedOpen, setUnmanagedOpen] = useState(true);
   const lastSavedSkillsRef = useRef<string[]>([]);
   const hasHydratedSkillSnapshotRef = useRef(false);
   const skipNextSkillAutosaveRef = useRef(true);
@@ -2472,10 +2503,36 @@ function AgentSkillsTab({
         })),
     [adapterEntryByKey, companySkills],
   );
+  const unmanagedSkillRows = useMemo<SkillRow[]>(() => {
+    const seen = new Set<string>();
+    return (skillSnapshot?.entries ?? [])
+      .filter((entry) => {
+        if (!isReadOnlyUnmanagedSkillEntry(entry, companySkillKeys)) return false;
+        if (seen.has(entry.key)) return false;
+        seen.add(entry.key);
+        return true;
+      })
+      .map((entry) => ({
+        id: `external:${entry.key}`,
+        key: entry.key,
+        name: entry.runtimeName ?? entry.key,
+        description: null,
+        detail: entry.detail ?? null,
+        locationLabel: entry.locationLabel ?? null,
+        originLabel: entry.originLabel ?? null,
+        linkTo: null,
+        readOnly: false,
+        adapterEntry: entry,
+      }));
+  }, [companySkillKeys, skillSnapshot]);
+  const unmanagedKeySet = useMemo(
+    () => new Set(unmanagedSkillRows.map((r) => r.key)),
+    [unmanagedSkillRows],
+  );
   const requiredSkillRows = useMemo<SkillRow[]>(
     () =>
       (skillSnapshot?.entries ?? [])
-        .filter((entry) => entry.required)
+        .filter((entry) => entry.required && !unmanagedKeySet.has(entry.key))
         .map((entry) => {
           const companySkill = companySkillByKey.get(entry.key);
           return {
@@ -2491,29 +2548,11 @@ function AgentSkillsTab({
             adapterEntry: entry,
           };
         }),
-    [companySkillByKey, skillSnapshot],
-  );
-  const unmanagedSkillRows = useMemo<SkillRow[]>(
-    () =>
-      (skillSnapshot?.entries ?? [])
-        .filter((entry) => isReadOnlyUnmanagedSkillEntry(entry, companySkillKeys))
-        .map((entry) => ({
-          id: `external:${entry.key}`,
-          key: entry.key,
-          name: entry.runtimeName ?? entry.key,
-          description: null,
-          detail: entry.detail ?? null,
-          locationLabel: entry.locationLabel ?? null,
-          originLabel: entry.originLabel ?? null,
-          linkTo: null,
-          readOnly: true,
-          adapterEntry: entry,
-        })),
-    [companySkillKeys, skillSnapshot],
+    [companySkillByKey, unmanagedKeySet, skillSnapshot],
   );
   const desiredOnlyMissingSkills = useMemo(
-    () => skillDraft.filter((key) => !companySkillByKey.has(key)),
-    [companySkillByKey, skillDraft],
+    () => skillDraft.filter((key) => !companySkillByKey.has(key) && !unmanagedKeySet.has(key)),
+    [companySkillByKey, unmanagedKeySet, skillDraft],
   );
   const skillApplicationLabel = useMemo(() => {
     switch (skillSnapshot?.mode) {
@@ -2707,7 +2746,7 @@ function AgentSkillsTab({
                       onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setUnmanagedOpen((v) => !v); } }}
                     >
                       <span className="text-xs font-medium text-muted-foreground">
-                        ({unmanagedSkillRows.length}) User-installed skills, not managed by Paperclip
+                        ({unmanagedSkillRows.length}) User-installed skills (from ~/.claude/skills)
                       </span>
                       {unmanagedOpen ? <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" /> : <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />}
                     </div>

@@ -1224,18 +1224,13 @@ function resolveRequestedSkillKeysOrThrow(
       continue;
     }
 
-    missing.add(trimmed);
+    // V2: Allow user-installed skills (from ~/.claude/skills) that aren't
+    // in the company library — pass them through as-is instead of rejecting.
+    resolved.add(trimmed);
   }
 
-  if (ambiguous.size > 0 || missing.size > 0) {
-    const problems: string[] = [];
-    if (ambiguous.size > 0) {
-      problems.push(`ambiguous references: ${Array.from(ambiguous).sort().join(", ")}`);
-    }
-    if (missing.size > 0) {
-      problems.push(`unknown references: ${Array.from(missing).sort().join(", ")}`);
-    }
-    throw unprocessable(`Invalid company skill selection (${problems.join("; ")}).`);
+  if (ambiguous.size > 0) {
+    throw unprocessable(`Invalid company skill selection (ambiguous references: ${Array.from(ambiguous).sort().join(", ")}).`);
   }
 
   return Array.from(resolved);

@@ -15,3 +15,8 @@ export { sidebarBadgeRoutes } from "./sidebar-badges.js";
 export { llmRoutes } from "./llms.js";
 export { accessRoutes } from "./access.js";
 export { instanceSettingsRoutes } from "./instance-settings.js";
+export { agentMemoryRoutes } from "./agent-memories.js";
+export { mcpServerRoutes } from "./mcp-servers.js";
+export { agentKpiRoutes } from "./agent-kpis.js";
+export { agentExperimentRoutes } from "./agent-experiments.js";
+export { skillChangeRoutes } from "./skill-changes.js";

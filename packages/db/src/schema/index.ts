@@ -58,3 +58,8 @@ export { pluginEntities } from "./plugin_entities.js";
 export { pluginJobs, pluginJobRuns } from "./plugin_jobs.js";
 export { pluginWebhookDeliveries } from "./plugin_webhooks.js";
 export { pluginLogs } from "./plugin_logs.js";
+export { agentProjectSessions } from "./agent_project_sessions.js";
+export { agentMemories } from "./agent_memories.js";
+export { companyMcpServers, agentMcpExclusions } from "./company_mcp_servers.js";
+export { skillChangeLog } from "./skill_change_log.js";
+export { agentKpis, agentKpiDefinitions, agentExperiments, agentKpiObservations } from "./agent_kpis.js";

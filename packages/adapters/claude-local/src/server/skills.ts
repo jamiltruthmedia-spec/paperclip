@@ -56,6 +56,8 @@ async function buildClaudeSkillSnapshot(config: Record<string, unknown>): Promis
 
   for (const desiredSkill of desiredSkills) {
     if (availableByKey.has(desiredSkill)) continue;
+    // V2: If the desired skill exists in ~/.claude/skills, don't mark it as missing
+    if (installed.has(desiredSkill)) continue;
     warnings.push(`Desired skill "${desiredSkill}" is not available from the Paperclip skills directory.`);
     entries.push({
       key: desiredSkill,
@@ -77,16 +79,18 @@ async function buildClaudeSkillSnapshot(config: Record<string, unknown>): Promis
     entries.push({
       key: name,
       runtimeName: name,
-      desired: false,
+      desired: desiredSet.has(name),
       managed: false,
-      state: "external",
+      state: desiredSet.has(name) ? "configured" : "external",
       origin: "user_installed",
       originLabel: "User-installed",
       locationLabel: "~/.claude/skills",
       readOnly: true,
       sourcePath: null,
       targetPath: installedEntry.targetPath ?? path.join(skillsHome, name),
-      detail: "Installed outside Paperclip management in the Claude skills home.",
+      detail: desiredSet.has(name)
+        ? "User-installed skill, selected for this agent."
+        : "Installed outside Paperclip management in the Claude skills home.",
     });
   }
 

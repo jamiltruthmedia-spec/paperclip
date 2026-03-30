@@ -49,12 +49,32 @@ async function buildSkillsDir(config: Record<string, unknown>): Promise<string> 
       availableEntries,
     ),
   );
+  // Symlink Paperclip-managed skills
   for (const entry of availableEntries) {
     if (!desiredNames.has(entry.key)) continue;
     await fs.symlink(
       entry.source,
       path.join(target, entry.runtimeName),
     );
+  }
+  // V2: Also symlink desired user-installed skills from ~/.claude/skills/
+  const managedKeys = new Set(availableEntries.map((e) => e.key));
+  const env =
+    typeof config.env === "object" && config.env !== null && !Array.isArray(config.env)
+      ? (config.env as Record<string, unknown>)
+      : {};
+  const configuredHome = typeof env.HOME === "string" && env.HOME.trim().length > 0 ? path.resolve(env.HOME.trim()) : os.homedir();
+  const skillsHome = path.join(configuredHome, ".claude", "skills");
+  for (const desiredSkill of desiredNames) {
+    if (managedKeys.has(desiredSkill)) continue; // already symlinked above
+    const skillPath = path.join(skillsHome, desiredSkill);
+    try {
+      await fs.access(skillPath);
+      const targetLink = path.join(target, desiredSkill);
+      try { await fs.access(targetLink); } catch { await fs.symlink(skillPath, targetLink); }
+    } catch {
+      // skill not found in ~/.claude/skills, skip
+    }
   }
   return tmp;
 }
@@ -354,16 +374,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const billingType = resolveClaudeBillingType(effectiveEnv);
   const skillsDir = await buildSkillsDir(config);
 
+  // V2: Memory file passthrough — resolve before instructions block
+  const memoryFilePath = typeof context.paperclipMemoryFilePath === "string" && context.paperclipMemoryFilePath.trim().length > 0
+    ? context.paperclipMemoryFilePath.trim()
+    : null;
+
   // When instructionsFilePath is configured, create a combined temp file that
   // includes both the file content and the path directive, so we only need
   // --append-system-prompt-file (Claude CLI forbids using both flags together).
+  // V2: Also append memory file if present.
   let effectiveInstructionsFilePath: string | undefined = instructionsFilePath;
+  const memoryFileContent = memoryFilePath
+    ? await fs.readFile(memoryFilePath, "utf-8").catch(() => null)
+    : null;
+
   if (instructionsFilePath) {
     try {
       const instructionsContent = await fs.readFile(instructionsFilePath, "utf-8");
       const pathDirective = `\nThe above agent instructions were loaded from ${instructionsFilePath}. Resolve any relative file references from ${instructionsFileDir}.`;
+      const memorySection = memoryFileContent ? `\n\n---\n\n${memoryFileContent}` : "";
       const combinedPath = path.join(skillsDir, "agent-instructions.md");
-      await fs.writeFile(combinedPath, instructionsContent + pathDirective, "utf-8");
+      await fs.writeFile(combinedPath, instructionsContent + pathDirective + memorySection, "utf-8");
       effectiveInstructionsFilePath = combinedPath;
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
@@ -373,6 +404,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       );
       effectiveInstructionsFilePath = undefined;
     }
+  } else if (memoryFileContent) {
+    // No instructions file, but we have memory — create a combined file just for memory
+    const combinedPath = path.join(skillsDir, "agent-instructions.md");
+    await fs.writeFile(combinedPath, memoryFileContent, "utf-8");
+    effectiveInstructionsFilePath = combinedPath;
   }
 
   const runtimeSessionParams = parseObject(runtime.sessionParams);
@@ -416,6 +452,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     heartbeatPromptChars: renderedPrompt.length,
   };
 
+  // V2: MCP config passthrough
+  const mcpConfigPath = typeof context.paperclipMcpConfigPath === "string" && context.paperclipMcpConfigPath.trim().length > 0
+    ? context.paperclipMcpConfigPath.trim()
+    : null;
+
   const buildClaudeArgs = (resumeSessionId: string | null) => {
     const args = ["--print", "-", "--output-format", "stream-json", "--verbose"];
     if (resumeSessionId) args.push("--resume", resumeSessionId);
@@ -427,6 +468,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (effectiveInstructionsFilePath) {
       args.push("--append-system-prompt-file", effectiveInstructionsFilePath);
     }
+    if (mcpConfigPath) args.push("--mcp-config", mcpConfigPath);
     args.push("--add-dir", skillsDir);
     if (extraArgs.length > 0) args.push(...extraArgs);
     return args;

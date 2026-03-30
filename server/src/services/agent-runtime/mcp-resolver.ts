@@ -17,34 +17,19 @@ interface McpServerConfig {
 export function mcpResolverService(db: Db) {
   return {
     async resolveMcpConfig(agentId: string, companyId: string) {
-      // Get all exclusions for this agent
-      const exclusions = await db
-        .select({ mcpServerId: agentMcpExclusions.mcpServerId })
-        .from(agentMcpExclusions)
-        .where(eq(agentMcpExclusions.agentId, agentId));
-
-      const excludedIds = exclusions.map((e) => e.mcpServerId);
-
-      // Get company-wide servers + agent-specific servers, minus exclusions
-      const conditions = [
-        eq(companyMcpServers.companyId, companyId),
-        eq(companyMcpServers.enabled, true),
-      ];
-
-      // Scope filter: company-wide or specifically for this agent
-      const allServers = await db
+      // V2: Opt-in model — agents only get MCPs explicitly assigned to them.
+      // Company-wide MCPs are a catalog; they must be explicitly added per agent.
+      const servers = await db
         .select()
         .from(companyMcpServers)
-        .where(and(...conditions));
-
-      const servers = allServers.filter((s) => {
-        // Exclude if in exclusion list
-        if (excludedIds.includes(s.id)) return false;
-        // Include if company-wide or specifically for this agent
-        if (s.scope === "company") return true;
-        if (s.scope === "agent" && s.agentId === agentId) return true;
-        return false;
-      });
+        .where(
+          and(
+            eq(companyMcpServers.companyId, companyId),
+            eq(companyMcpServers.enabled, true),
+            eq(companyMcpServers.scope, "agent"),
+            eq(companyMcpServers.agentId, agentId),
+          ),
+        );
 
       return servers;
     },
@@ -87,12 +72,10 @@ export function mcpResolverService(db: Db) {
     },
 
     async syncFromClaudeCode(companyId: string) {
-      // Claude Code stores user-scoped MCPs in ~/.claude.json under "mcpServers"
-      // and project-scoped MCPs in .mcp.json files.
-      const sources = [
-        path.join(os.homedir(), ".claude.json"),
-        path.join(process.cwd(), ".mcp.json"),
-      ];
+      // Claude Code stores MCPs in ~/.claude.json:
+      //   - "mcpServers" for user-scoped MCPs
+      //   - "projects.<path>.mcpServers" for project-scoped MCPs
+      // Also reads .mcp.json in current working directory
 
       const discovered: Array<{
         name: string;
@@ -102,40 +85,77 @@ export function mcpResolverService(db: Db) {
         transportType: "stdio" | "http" | "sse";
         transportUrl?: string;
         configPath: string;
+        projectPath?: string;
       }> = [];
 
-      for (const configPath of sources) {
-        if (!fs.existsSync(configPath)) continue;
+      const claudeJsonPath = path.join(os.homedir(), ".claude.json");
 
-        let parsed: Record<string, unknown>;
-        try {
-          parsed = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-        } catch {
-          continue;
-        }
-
-        const mcpServers = (parsed.mcpServers ?? {}) as Record<
-          string,
-          {
-            command?: string;
-            args?: string[];
-            env?: Record<string, string>;
-            type?: string;
-            url?: string;
-          }
-        >;
-
+      // Helper to extract MCPs from a mcpServers object
+      const extractMcps = (
+        mcpServers: Record<string, { command?: string; args?: string[]; env?: Record<string, string>; type?: string; url?: string }>,
+        configPath: string,
+        projectPath?: string,
+      ) => {
         for (const [name, config] of Object.entries(mcpServers)) {
           const transportType = (config.type as "stdio" | "http" | "sse") ?? "stdio";
-          discovered.push({
-            name,
-            command: config.command ?? "",
-            args: config.args ?? [],
-            env: config.env ?? {},
-            transportType,
-            transportUrl: config.url,
-            configPath,
-          });
+          // Deduplicate by name — user-scoped takes priority over project-scoped
+          if (!discovered.find((d) => d.name === name)) {
+            discovered.push({
+              name,
+              command: config.command ?? "",
+              args: config.args ?? [],
+              env: config.env ?? {},
+              transportType,
+              transportUrl: config.url,
+              configPath,
+              projectPath,
+            });
+          }
+        }
+      };
+
+      // Read ~/.claude.json — user-scoped MCPs + project-scoped MCPs
+      if (fs.existsSync(claudeJsonPath)) {
+        try {
+          const parsed = JSON.parse(fs.readFileSync(claudeJsonPath, "utf-8")) as Record<string, unknown>;
+
+          // User-scoped MCPs
+          if (parsed.mcpServers && typeof parsed.mcpServers === "object") {
+            extractMcps(
+              parsed.mcpServers as Record<string, { command?: string; args?: string[]; env?: Record<string, string>; type?: string; url?: string }>,
+              claudeJsonPath,
+            );
+          }
+
+          // Project-scoped MCPs from all projects
+          const projects = (parsed.projects ?? {}) as Record<string, { mcpServers?: Record<string, unknown> }>;
+          for (const [projectPath, projectConfig] of Object.entries(projects)) {
+            if (projectConfig.mcpServers && typeof projectConfig.mcpServers === "object") {
+              extractMcps(
+                projectConfig.mcpServers as Record<string, { command?: string; args?: string[]; env?: Record<string, string>; type?: string; url?: string }>,
+                claudeJsonPath,
+                projectPath,
+              );
+            }
+          }
+        } catch {
+          // ignore parse errors
+        }
+      }
+
+      // Also read .mcp.json in cwd if present
+      const cwdMcpJson = path.join(process.cwd(), ".mcp.json");
+      if (fs.existsSync(cwdMcpJson)) {
+        try {
+          const parsed = JSON.parse(fs.readFileSync(cwdMcpJson, "utf-8")) as Record<string, unknown>;
+          if (parsed.mcpServers && typeof parsed.mcpServers === "object") {
+            extractMcps(
+              parsed.mcpServers as Record<string, { command?: string; args?: string[]; env?: Record<string, string>; type?: string; url?: string }>,
+              cwdMcpJson,
+            );
+          }
+        } catch {
+          // ignore
         }
       }
 

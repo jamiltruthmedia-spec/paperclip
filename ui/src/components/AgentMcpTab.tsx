@@ -7,15 +7,7 @@ import { Link } from "@/lib/router";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import { Server, ExternalLink, ShieldOff, ShieldCheck, Settings } from "lucide-react";
+import { Server, ExternalLink, Plus, Trash2, Settings } from "lucide-react";
 import { useState } from "react";
 
 const transportColors: Record<string, string> = {
@@ -33,41 +25,55 @@ interface AgentMcpTabProps {
 export function AgentMcpTab({ agentId, companyId, companyPrefix }: AgentMcpTabProps) {
   const queryClient = useQueryClient();
   const { pushToast } = useToast();
-  const [confirmExclusion, setConfirmExclusion] = useState<{
-    serverId: string;
-    action: "add" | "remove";
-    name: string;
-  } | null>(null);
+  const [confirmRemove, setConfirmRemove] = useState<{ serverId: string; name: string } | null>(null);
 
   const serversQuery = useQuery({
     queryKey: queryKeys.mcpServers.list(companyId),
     queryFn: () => mcpServersApi.list(companyId),
   });
 
-  const addExclusionMutation = useMutation({
-    mutationFn: (serverId: string) => mcpServersApi.addExclusion(agentId, serverId),
+  // Add MCP to this agent: create an agent-scoped copy
+  const addMutation = useMutation({
+    mutationFn: (server: McpServer) =>
+      mcpServersApi.create(companyId, {
+        name: server.name,
+        description: server.description ?? undefined,
+        command: server.command,
+        args: server.args,
+        env: server.env,
+        transportType: server.transportType,
+        transportUrl: server.transportUrl ?? undefined,
+        scope: "agent",
+        agentId,
+      }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.mcpServers.list(companyId) });
-      pushToast({ title: "MCP excluded for this agent" });
-      setConfirmExclusion(null);
+      pushToast({ title: "MCP added to this agent" });
     },
-    onError: () => pushToast({ tone: "warn", title: "Failed to add exclusion" }),
+    onError: () => pushToast({ tone: "warn", title: "Failed to add MCP" }),
   });
 
-  const removeExclusionMutation = useMutation({
-    mutationFn: (serverId: string) => mcpServersApi.removeExclusion(agentId, serverId),
+  // Remove MCP from this agent: delete the agent-scoped record
+  const removeMutation = useMutation({
+    mutationFn: (serverId: string) => mcpServersApi.delete(companyId, serverId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.mcpServers.list(companyId) });
-      pushToast({ title: "Exclusion removed" });
-      setConfirmExclusion(null);
+      pushToast({ title: "MCP removed from this agent" });
+      setConfirmRemove(null);
     },
-    onError: () => pushToast({ tone: "warn", title: "Failed to remove exclusion" }),
+    onError: () => pushToast({ tone: "warn", title: "Failed to remove MCP" }),
   });
 
   const servers = serversQuery.data ?? [];
-  const companyServers = servers.filter((s) => s.scope === "company" && s.enabled);
-  const agentServers = servers.filter((s) => s.scope === "agent" && s.agentId === agentId);
-  const allRelevant = [...companyServers, ...agentServers];
+
+  // MCPs active for this agent (explicitly assigned)
+  const agentServers = servers.filter((s) => s.scope === "agent" && s.agentId === agentId && s.enabled);
+  const agentServerNames = new Set(agentServers.map((s) => s.name));
+
+  // Available catalog (company-wide MCPs not yet added to this agent)
+  const catalogServers = servers.filter(
+    (s) => s.scope === "company" && s.enabled && !agentServerNames.has(s.name),
+  );
 
   if (serversQuery.isLoading) {
     return (
@@ -82,148 +88,144 @@ export function AgentMcpTab({ agentId, companyId, companyPrefix }: AgentMcpTabPr
     );
   }
 
-  if (allRelevant.length === 0) {
-    return (
-      <div className="flex flex-col items-center justify-center py-16 text-center">
-        <Server className="h-10 w-10 text-muted-foreground/30 mb-3" />
-        <p className="text-sm text-muted-foreground mb-4">
-          No MCPs configured. Set up MCPs in company settings.
-        </p>
-        <Link to={`/${companyPrefix}/mcp-servers`}>
-          <Button variant="outline" size="sm">
-            <Settings className="h-3.5 w-3.5 mr-1.5" />
-            Company MCP Settings
-          </Button>
-        </Link>
-      </div>
-    );
-  }
-
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <p className="text-xs text-muted-foreground">
-          {allRelevant.length} MCP server{allRelevant.length !== 1 ? "s" : ""} available to this
-          agent
-        </p>
-        <Link to={`/${companyPrefix}/mcp-servers`}>
-          <Button variant="outline" size="sm">
-            <ExternalLink className="h-3.5 w-3.5 mr-1.5" />
-            Manage MCPs
-          </Button>
-        </Link>
-      </div>
-
-      <div className="space-y-2">
-        {allRelevant.map((server) => (
-          <McpServerCard
-            key={server.id}
-            server={server}
-            onExclude={() =>
-              setConfirmExclusion({ serverId: server.id, action: "add", name: server.name })
-            }
-            onRemoveExclusion={() =>
-              setConfirmExclusion({ serverId: server.id, action: "remove", name: server.name })
-            }
-          />
-        ))}
-      </div>
-
-      {/* Exclusion Confirmation */}
-      <Dialog
-        open={!!confirmExclusion}
-        onOpenChange={(open) => !open && setConfirmExclusion(null)}
-      >
-        <DialogContent className="sm:max-w-sm">
-          <DialogHeader>
-            <DialogTitle>
-              {confirmExclusion?.action === "add" ? "Exclude MCP" : "Remove Exclusion"}
-            </DialogTitle>
-            <DialogDescription>
-              {confirmExclusion?.action === "add"
-                ? `Exclude "${confirmExclusion.name}" from this agent? The agent will no longer have access to this MCP server.`
-                : `Remove the exclusion for "${confirmExclusion?.name}"? The agent will regain access to this MCP server.`}
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button variant="ghost" onClick={() => setConfirmExclusion(null)}>
-              Cancel
-            </Button>
-            <Button
-              variant={confirmExclusion?.action === "add" ? "destructive" : "default"}
-              onClick={() => {
-                if (!confirmExclusion) return;
-                if (confirmExclusion.action === "add") {
-                  addExclusionMutation.mutate(confirmExclusion.serverId);
-                } else {
-                  removeExclusionMutation.mutate(confirmExclusion.serverId);
-                }
-              }}
-              disabled={addExclusionMutation.isPending || removeExclusionMutation.isPending}
-            >
-              {addExclusionMutation.isPending || removeExclusionMutation.isPending
-                ? "Saving..."
-                : "Confirm"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-    </div>
-  );
-}
-
-function McpServerCard({
-  server,
-  onExclude,
-  onRemoveExclusion,
-}: {
-  server: McpServer;
-  onExclude: () => void;
-  onRemoveExclusion: () => void;
-}) {
-  return (
-    <Card className="p-4">
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 mb-1">
-            <Server className="h-4 w-4 text-muted-foreground shrink-0" />
-            <h4 className="text-sm font-medium truncate">{server.name}</h4>
-            <Badge
-              variant="secondary"
-              className={cn("text-[10px] px-1.5 py-0", transportColors[server.transportType])}
-            >
-              {server.transportType}
-            </Badge>
-            <Badge
-              variant="secondary"
-              className="text-[10px] px-1.5 py-0"
-            >
-              {server.scope}
-            </Badge>
-            {!server.enabled && (
-              <Badge variant="secondary" className="text-[10px] px-1.5 py-0 bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300">
-                disabled
-              </Badge>
+      {/* Active MCPs for this agent */}
+      <div>
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-sm font-medium">
+            Active MCPs
+            {agentServers.length > 0 && (
+              <span className="ml-2 text-xs text-muted-foreground font-normal">
+                {agentServers.length} enabled
+              </span>
             )}
-          </div>
-          {server.description && (
-            <p className="text-xs text-muted-foreground line-clamp-1 ml-6">
-              {server.description}
-            </p>
-          )}
-          <p className="text-xs text-muted-foreground/60 ml-6 mt-0.5 font-mono">
-            {server.command} {server.args.join(" ")}
-          </p>
-        </div>
-        <div className="shrink-0">
-          {server.scope === "company" && (
-            <Button size="sm" variant="ghost" className="h-7 text-xs" onClick={onExclude}>
-              <ShieldOff className="h-3.5 w-3.5 mr-1" />
-              Exclude
+          </h3>
+          <Link to={`/${companyPrefix}/mcp-servers`}>
+            <Button variant="ghost" size="sm" className="h-7 text-xs">
+              <ExternalLink className="h-3 w-3 mr-1" />
+              Manage catalog
             </Button>
-          )}
+          </Link>
         </div>
+
+        {agentServers.length === 0 ? (
+          <div className="rounded-lg border border-dashed border-border p-6 text-center">
+            <Server className="h-8 w-8 text-muted-foreground/30 mx-auto mb-2" />
+            <p className="text-sm text-muted-foreground">No MCPs active for this agent.</p>
+            <p className="text-xs text-muted-foreground/60 mt-1">Add from the catalog below.</p>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {agentServers.map((server) => (
+              <Card key={server.id} className="p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <Server className="h-4 w-4 text-muted-foreground shrink-0" />
+                    <span className="text-sm font-medium truncate">{server.name}</span>
+                    <Badge
+                      variant="secondary"
+                      className={cn("text-[10px] px-1.5 py-0 shrink-0", transportColors[server.transportType])}
+                    >
+                      {server.transportType}
+                    </Badge>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 text-xs text-destructive hover:text-destructive shrink-0"
+                    onClick={() => setConfirmRemove({ serverId: server.id, name: server.name })}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+                {(server.transportUrl || server.command) && (
+                  <p className="text-xs text-muted-foreground/50 font-mono mt-1 ml-6 truncate">
+                    {server.transportUrl ?? `${server.command} ${server.args.join(" ")}`}
+                  </p>
+                )}
+              </Card>
+            ))}
+          </div>
+        )}
       </div>
-    </Card>
+
+      {/* Catalog — available to add */}
+      {catalogServers.length > 0 && (
+        <div>
+          <h3 className="text-sm font-medium mb-3 text-muted-foreground">
+            Available to add
+          </h3>
+          <div className="space-y-2">
+            {catalogServers.map((server) => (
+              <Card key={server.id} className="p-3 opacity-70 hover:opacity-100 transition-opacity">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <Server className="h-4 w-4 text-muted-foreground shrink-0" />
+                    <span className="text-sm truncate">{server.name}</span>
+                    <Badge
+                      variant="secondary"
+                      className={cn("text-[10px] px-1.5 py-0 shrink-0", transportColors[server.transportType])}
+                    >
+                      {server.transportType}
+                    </Badge>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 text-xs shrink-0"
+                    disabled={addMutation.isPending}
+                    onClick={() => addMutation.mutate(server)}
+                  >
+                    <Plus className="h-3.5 w-3.5 mr-1" />
+                    Add
+                  </Button>
+                </div>
+              </Card>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {catalogServers.length === 0 && agentServers.length === 0 && (
+        <div className="flex flex-col items-center justify-center py-16 text-center">
+          <Server className="h-10 w-10 text-muted-foreground/30 mb-3" />
+          <p className="text-sm text-muted-foreground mb-4">
+            No MCP servers in the company catalog yet.
+          </p>
+          <Link to={`/${companyPrefix}/mcp-servers`}>
+            <Button variant="outline" size="sm">
+              <Settings className="h-3.5 w-3.5 mr-1.5" />
+              Set up MCPs
+            </Button>
+          </Link>
+        </div>
+      )}
+
+      {/* Remove confirmation */}
+      {confirmRemove && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+          <div className="bg-background rounded-lg border border-border p-6 max-w-sm w-full mx-4 shadow-xl">
+            <h3 className="text-sm font-semibold mb-2">Remove MCP</h3>
+            <p className="text-sm text-muted-foreground mb-4">
+              Remove <strong>{confirmRemove.name}</strong> from this agent? The agent will lose access to these tools.
+            </p>
+            <div className="flex gap-2 justify-end">
+              <Button variant="ghost" size="sm" onClick={() => setConfirmRemove(null)}>
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                size="sm"
+                disabled={removeMutation.isPending}
+                onClick={() => removeMutation.mutate(confirmRemove.serverId)}
+              >
+                {removeMutation.isPending ? "Removing..." : "Remove"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }

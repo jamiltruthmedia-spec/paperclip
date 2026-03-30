@@ -33,8 +33,10 @@ export function mcpServerRoutes(db: Db) {
 
     const { name, description, command, args, env, transportType, transportUrl, scope, agentId } = req.body;
 
-    if (!name || !command || !transportType) {
-      res.status(400).json({ error: "Missing required fields: name, command, transportType" });
+    // HTTP/SSE MCPs don't need a command — they use a URL instead
+    const needsCommand = transportType === "stdio";
+    if (!name || !transportType || (needsCommand && !command)) {
+      res.status(400).json({ error: "Missing required fields: name, transportType (and command for stdio)" });
       return;
     }
 

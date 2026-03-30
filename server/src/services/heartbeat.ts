@@ -2137,12 +2137,20 @@ export function heartbeatService(db: Db) {
       ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, taskKey)
       : null;
     // V2: Per-project session — use project session as primary if available
+    // V2: Per-project session — normalize to same shape as taskSession
     let v2ProjectSession: { sessionParamsJson: Record<string, unknown> | null; sessionDisplayId: string | null } | null = null;
     if (executionProjectId) {
       try {
         const { sessionResolverService } = await import("./agent-runtime/session-resolver.js");
         const sessionResolver = sessionResolverService(db);
-        v2ProjectSession = await sessionResolver.resolveSession(agent.id, agent.adapterType, executionProjectId);
+        const rawSession = await sessionResolver.resolveSession(agent.id, agent.adapterType, executionProjectId);
+        if (rawSession) {
+          v2ProjectSession = {
+            // agent_project_sessions uses "sessionParams" column; normalize for heartbeat
+            sessionParamsJson: (rawSession as { sessionParams?: Record<string, unknown> | null }).sessionParams ?? null,
+            sessionDisplayId: rawSession.sessionDisplayId ?? null,
+          };
+        }
       } catch (err) {
         logger.warn({ err, agentId: agent.id }, "V2: failed to resolve project session, falling back to task session");
       }
@@ -2680,28 +2688,96 @@ export function heartbeatService(db: Db) {
         const { memoryLoaderService } = await import("./agent-runtime/memory-loader.js");
         const memoryLoader = memoryLoaderService(db);
         const memories = await memoryLoader.loadMemories(agent.id, executionProjectId ?? undefined);
-        if (memories.length > 0) {
-          const os = await import("node:os");
-          const fsSync = await import("node:fs");
-          const pathMod = await import("node:path");
-          const tempDir = fsSync.mkdtempSync(pathMod.join(os.tmpdir(), "paperclip-memory-"));
-          const memoryMd = memories.map((m) =>
-            `## ${m.title}\n**Category:** ${m.category} | **Source:** ${m.source} | **Scope:** ${m.scope}\n\n${m.content}`
-          ).join("\n\n---\n\n");
-          const memoryContent = `# Agent Memory\n\nThese are your accumulated memories and learnings. Use them to inform your work.\n\n${memoryMd}`;
-          const memoryPath = pathMod.join(tempDir, "agent-memory.md");
-          fsSync.writeFileSync(memoryPath, memoryContent);
-          context.paperclipMemoryFilePath = memoryPath;
-          logger.info(
-            { agentId: agent.id, runId: run.id, memoryCount: memories.length },
-            "V2: injecting agent memories into run",
-          );
-          memoryCleanup = () => {
-            try { fsSync.rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
-          };
-        }
+        const os = await import("node:os");
+        const fsSync = await import("node:fs");
+        const pathMod = await import("node:path");
+        const tempDir = fsSync.mkdtempSync(pathMod.join(os.tmpdir(), "paperclip-memory-"));
+
+        const memorySection = memories.length > 0
+          ? `# Your Memories\n\nThese are your accumulated learnings. Use them to inform your work.\n\n${
+              memories.map((m) =>
+                `## ${m.title}\n**Category:** ${m.category} | **Source:** ${m.source} | **Scope:** ${m.scope}\n\n${m.content}`
+              ).join("\n\n---\n\n")
+            }\n\n`
+          : "";
+
+        // Self-reflection instructions — always injected so agent can write memories
+        const apiUrl = process.env.PAPERCLIP_API_URL ?? `http://localhost:${process.env.PORT ?? 3100}`;
+        const reflectionInstructions = `# Self-Improvement Instructions
+
+At the end of your work on this task, write 1-3 memory entries about what you learned. Be specific and actionable.
+
+Call this API for each memory entry:
+\`\`\`
+POST ${apiUrl}/api/agents/me/memories
+Authorization: Bearer $PAPERCLIP_API_KEY
+Content-Type: application/json
+
+{
+  "scope": "global" | "project",
+  "projectId": "<project id if project-scoped, omit for global>",
+  "category": "pattern" | "preference" | "decision" | "learning" | "feedback",
+  "title": "<short title>",
+  "content": "<what you learned, what worked, what to do differently next time>",
+  "confidence": 0.0-1.0
+}
+\`\`\`
+
+Write memories for:
+- **Patterns** you noticed (recurring problems, solutions that work)
+- **Preferences** expressed by the team (how they like things done)
+- **Decisions** you made and why (so you don't re-litigate them)
+- **Learnings** from failures or surprises
+- **Feedback** you received (implicit or explicit)
+
+Keep memories concise and specific. Don't write vague platitudes.`;
+
+        const experimentSection = typeof context.v2ExperimentInstruction === "string"
+          ? `\n\n${context.v2ExperimentInstruction}`
+          : "";
+        const memoryContent = memorySection + reflectionInstructions + experimentSection;
+        const memoryPath = pathMod.join(tempDir, "agent-memory.md");
+        fsSync.writeFileSync(memoryPath, memoryContent);
+        context.paperclipMemoryFilePath = memoryPath;
+        logger.info(
+          { agentId: agent.id, runId: run.id, memoryCount: memories.length },
+          "V2: injecting agent memories into run",
+        );
+        memoryCleanup = () => {
+          try { fsSync.rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
+        };
       } catch (memErr) {
         logger.warn({ err: memErr, agentId: agent.id, runId: run.id }, "V2: failed to load agent memories");
+      }
+
+      // V2 Layer 3: Inject active experiment approach into context
+      try {
+        const { agentExperiments: expTable } = await import("@paperclipai/db");
+        const activeExps = await db
+          .select()
+          .from(expTable)
+          .where(and(eq(expTable.agentId, agent.id), eq(expTable.status, "running")))
+          .limit(1);
+
+        if (activeExps[0]) {
+          const exp = activeExps[0];
+          // Alternate between approaches based on run count (simple round-robin)
+          const totalRuns = exp.runsA + exp.runsB;
+          const useApproachA = totalRuns % 2 === 0;
+          const approach = useApproachA ? "a" : "b";
+          const approachText = useApproachA ? exp.approachA : exp.approachB;
+
+          context.v2ExperimentApproach = approach;
+          context.v2ExperimentId = exp.id;
+          context.v2ExperimentInstruction = `\n\n## Active Experiment\nHypothesis: ${exp.hypothesis}\nFor this run, use **Approach ${approach.toUpperCase()}**: ${approachText}`;
+
+          logger.info(
+            { experimentId: exp.id, approach, agentId: agent.id },
+            "V2: injecting experiment approach into run",
+          );
+        }
+      } catch (expErr) {
+        logger.warn({ err: expErr, agentId: agent.id }, "V2: failed to inject experiment context");
       }
 
       // V2: Resolve MCP servers for this agent and inject config path into context
@@ -2973,6 +3049,158 @@ export function heartbeatService(db: Db) {
           logger.info({ agentId: agent.id, runId: run.id, outcome }, "V2: recorded post-run KPIs");
         } catch (err) {
           logger.warn({ err, agentId: agent.id, runId: run.id }, "V2: failed to record post-run KPIs");
+        }
+
+        // V2 Layer 2: Trigger CEO + board review every N runs
+        try {
+          const CEO_REVIEW_INTERVAL = 10; // Every 10 runs across any agent in the company
+          const { agentKpis: kpiTable, agents: agentsTable } = await import("@paperclipai/db");
+          const { count } = await import("drizzle-orm");
+
+          // Count total company KPIs
+          const [{ value: totalKpis }] = await db
+            .select({ value: count() })
+            .from(kpiTable)
+            .where(eq(kpiTable.companyId, agent.companyId));
+
+          if (totalKpis > 0 && totalKpis % CEO_REVIEW_INTERVAL === 0) {
+            // Find CEO agent (role === "ceo" or reportsTo === null and not the current agent)
+            const ceoAgents = await db
+              .select()
+              .from(agentsTable)
+              .where(
+                and(
+                  eq(agentsTable.companyId, agent.companyId),
+                  eq(agentsTable.role, "ceo"),
+                ),
+              )
+              .limit(1);
+
+            const ceoAgent = ceoAgents[0];
+            if (ceoAgent && ceoAgent.id !== agent.id && ceoAgent.status !== "paused") {
+              // Build a trend report for the CEO
+              const { kpiAnalyticsService } = await import("./agent-runtime/kpi-analytics.js");
+              const analytics = kpiAnalyticsService(db);
+              const companyAnalytics = await analytics.getCompanyAnalytics(agent.companyId);
+
+              const agentSummaries = companyAnalytics.agents
+                .filter((a) => a.totalRuns > 0)
+                .map((a) =>
+                  `- **${a.agentName}**: ${a.totalRuns} runs, ${a.completionRate != null ? Math.round(a.completionRate * 100) : "?"}% completion, avg $${((a.avgCostCents ?? 0) / 100).toFixed(3)}/run`
+                )
+                .join("\n");
+
+              const reviewPrompt = `# Company Performance Review — ${new Date().toDateString()}
+
+This is your scheduled performance review. The company has completed ${totalKpis} agent runs total.
+
+## Agent Performance Summary
+${agentSummaries || "No data yet."}
+
+## Your Task
+Review this data and decide if any action is needed:
+1. Are any agents underperforming (low completion rate, high cost, high errors)?
+2. Are there patterns that suggest a skill or memory update would help?
+3. Should any agent's MCP access or skills be changed?
+4. Write an observation to the board via POST /api/companies/${agent.companyId}/analytics/observations if you notice anything significant.
+
+Focus on **trends over time**, not single runs. Only act when you see a sustained pattern.`;
+
+              await enqueueWakeup(ceoAgent.id, {
+                source: "on_demand",
+                reason: "ceo_performance_review",
+                contextSnapshot: {
+                  wakeReason: "ceo_performance_review",
+                  reviewPrompt,
+                  totalCompanyRuns: totalKpis,
+                  triggeredByAgent: agent.name,
+                  triggeredByRun: run.id,
+                },
+              });
+
+              logger.info(
+                { ceoAgentId: ceoAgent.id, totalKpis, companyId: agent.companyId },
+                "V2: triggered CEO performance review wakeup",
+              );
+            }
+          }
+        } catch (reviewErr) {
+          logger.warn({ err: reviewErr, agentId: agent.id }, "V2: failed to trigger CEO review");
+        }
+
+        // V2 Layer 3: Update active experiments with this run's results
+        try {
+          const { agentExperiments: expTable } = await import("@paperclipai/db");
+
+          const activeExperiments = await db
+            .select()
+            .from(expTable)
+            .where(
+              and(
+                eq(expTable.agentId, agent.id),
+                eq(expTable.status, "running"),
+              ),
+            );
+
+          for (const experiment of activeExperiments) {
+            // Determine which approach was used (stored in context)
+            const approachUsed = typeof context.v2ExperimentApproach === "string"
+              ? context.v2ExperimentApproach
+              : null;
+            if (!approachUsed || (approachUsed !== "a" && approachUsed !== "b")) continue;
+
+            const kpiResult = {
+              taskCompleted: outcome === "succeeded",
+              tokensUsed: (normalizedUsage?.inputTokens ?? 0) + (normalizedUsage?.outputTokens ?? 0),
+              costCents: adapterResult.costUsd != null ? Math.round(adapterResult.costUsd * 100) : 0,
+              durationSeconds: run.startedAt ? Math.round((Date.now() - run.startedAt.getTime()) / 1000) : 0,
+            };
+
+            const isA = approachUsed === "a";
+            const newRunsA = isA ? experiment.runsA + 1 : experiment.runsA;
+            const newRunsB = isA ? experiment.runsB : experiment.runsB + 1;
+            const currentResults = isA
+              ? (experiment.kpiResultsA as Record<string, unknown>)
+              : (experiment.kpiResultsB as Record<string, unknown>);
+
+            // Rolling average update
+            const prevCount = isA ? experiment.runsA : experiment.runsB;
+            const updatedResults: Record<string, unknown> = {
+              completionRate: ((Number(currentResults.completionRate ?? 0) * prevCount) + (kpiResult.taskCompleted ? 1 : 0)) / (prevCount + 1),
+              avgTokens: ((Number(currentResults.avgTokens ?? 0) * prevCount) + kpiResult.tokensUsed) / (prevCount + 1),
+              avgCostCents: ((Number(currentResults.avgCostCents ?? 0) * prevCount) + kpiResult.costCents) / (prevCount + 1),
+              avgDurationSeconds: ((Number(currentResults.avgDurationSeconds ?? 0) * prevCount) + kpiResult.durationSeconds) / (prevCount + 1),
+              runs: prevCount + 1,
+            };
+
+            // Auto-conclude if enough runs (min 5 per approach)
+            const shouldConclude = newRunsA >= 5 && newRunsB >= 5;
+            const aCompletion = isA ? Number(updatedResults.completionRate) : Number((experiment.kpiResultsA as Record<string,unknown>).completionRate ?? 0);
+            const bCompletion = isA ? Number((experiment.kpiResultsB as Record<string,unknown>).completionRate ?? 0) : Number(updatedResults.completionRate);
+            const winner = shouldConclude ? (aCompletion >= bCompletion ? "a" : "b") : null;
+
+            const { kpiAnalyticsService } = await import("./agent-runtime/kpi-analytics.js");
+            const analytics = kpiAnalyticsService(db);
+            await analytics.updateExperiment(experiment.id, {
+              runsA: newRunsA,
+              runsB: newRunsB,
+              kpiResultsA: isA ? updatedResults : (experiment.kpiResultsA as Record<string, unknown>),
+              kpiResultsB: isA ? (experiment.kpiResultsB as Record<string, unknown>) : updatedResults,
+              ...(shouldConclude && winner ? {
+                status: "concluded",
+                winningApproach: winner,
+                concludedAt: new Date(),
+                changeNotes: `Auto-concluded after ${newRunsA + newRunsB} runs. Winner: Approach ${winner.toUpperCase()} (${(aCompletion * 100).toFixed(1)}% vs ${(bCompletion * 100).toFixed(1)}% completion rate).`,
+              } : {}),
+            });
+
+            logger.info(
+              { experimentId: experiment.id, approachUsed, shouldConclude, winner },
+              "V2: updated experiment results",
+            );
+          }
+        } catch (expErr) {
+          logger.warn({ err: expErr, agentId: agent.id }, "V2: failed to update experiments");
         }
       }
       await finalizeAgentStatus(agent.id, outcome);

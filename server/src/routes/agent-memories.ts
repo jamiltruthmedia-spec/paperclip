@@ -9,6 +9,48 @@ export function agentMemoryRoutes(db: Db) {
   const router = Router();
   const svc = memoryLoaderService(db);
 
+  // Agent self-write: POST /agents/me/memories (called by agent during/after runs)
+  router.post("/agents/me/memories", async (req, res) => {
+    if (req.actor.type !== "agent" || !req.actor.agentId || !req.actor.companyId) {
+      res.status(401).json({ error: "Agent authentication required" });
+      return;
+    }
+    const agentId = req.actor.agentId;
+    const companyId = req.actor.companyId;
+
+    const { scope, projectId, category, title, content, confidence } = req.body;
+    if (!scope || !category || !title || !content) {
+      res.status(400).json({ error: "Missing required fields: scope, category, title, content" });
+      return;
+    }
+
+    const memory = await svc.saveMemory({
+      agentId,
+      companyId,
+      scope,
+      projectId: projectId ?? null,
+      category,
+      title,
+      content,
+      source: "self",
+      confidence: confidence ?? 0.7,
+    });
+
+    res.status(201).json(memory);
+  });
+
+  // Agent self-read: GET /agents/me/memories
+  router.get("/agents/me/memories", async (req, res) => {
+    if (req.actor.type !== "agent" || !req.actor.agentId) {
+      res.status(401).json({ error: "Agent authentication required" });
+      return;
+    }
+    const scope = req.query.scope as "global" | "project" | undefined;
+    const projectId = req.query.projectId as string | undefined;
+    const memories = await svc.loadMemories(req.actor.agentId, projectId, { scope });
+    res.json(memories);
+  });
+
   async function getAgentCompanyId(agentId: string): Promise<string | null> {
     const [agent] = await db
       .select({ companyId: agents.companyId })

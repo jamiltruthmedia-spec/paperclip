@@ -116,18 +116,23 @@ export function agentRuntimeService(db: Db) {
       );
 
       // 3. Update session state
-      await sessions.updateSession(session.id, {
-        lastRunId: context.runId ?? null,
-        runCount: session.runCount + 1,
-        totalInputTokens: session.totalInputTokens + (result.inputTokens ?? 0),
-        totalOutputTokens: session.totalOutputTokens + (result.outputTokens ?? 0),
-        sessionId: result.sessionId ?? session.sessionId,
-        sessionParams: result.sessionParams ?? session.sessionParams,
-      });
+      if (session) {
+        await sessions.updateSession(
+          session.agentId,
+          session.adapterType,
+          session.projectId ?? null,
+          {
+            lastRunId: context.runId ?? null,
+            runCount: 1,
+            inputTokens: result.inputTokens ?? 0,
+            outputTokens: result.outputTokens ?? 0,
+          },
+        );
+      }
 
       return {
         ...result,
-        sessionId: session.id,
+        sessionId: session?.id ?? null,
         skillChanges,
       };
     },

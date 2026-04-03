@@ -18,7 +18,6 @@ import { PageSkeleton } from "../components/PageSkeleton";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
   Dialog,
@@ -28,13 +27,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import {
   BarChart3,
   TrendingUp,
@@ -47,17 +39,12 @@ import {
   FlaskConical,
 } from "lucide-react";
 
-const severityColors: Record<string, string> = {
-  info: "bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300",
-  warning: "bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300",
-  critical: "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300",
-};
-
 const experimentStatusColors: Record<string, string> = {
   draft: "bg-gray-100 text-gray-800 dark:bg-gray-900/30 dark:text-gray-300",
   running: "bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300",
   paused: "bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300",
   completed: "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300",
+  concluded: "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300",
   cancelled: "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300",
 };
 
@@ -69,11 +56,7 @@ export function Analytics() {
   const companyId = selectedCompanyId!;
 
   const [obsDialogOpen, setObsDialogOpen] = useState(false);
-  const [obsForm, setObsForm] = useState({
-    title: "",
-    content: "",
-    severity: "info" as "info" | "warning" | "critical",
-  });
+  const [obsForm, setObsForm] = useState({ observation: "" });
   const [deleteObsConfirm, setDeleteObsConfirm] = useState<string | null>(null);
 
   useEffect(() => {
@@ -104,7 +87,7 @@ export function Analytics() {
       queryClient.invalidateQueries({ queryKey: queryKeys.observations.list(companyId) });
       pushToast({ title: "Observation created" });
       setObsDialogOpen(false);
-      setObsForm({ title: "", content: "", severity: "info" });
+      setObsForm({ observation: "" });
     },
     onError: () => pushToast({ tone: "warn", title: "Failed to create observation" }),
   });
@@ -122,15 +105,13 @@ export function Analytics() {
   const analytics = analyticsQuery.data;
   const observations = observationsQuery.data ?? [];
   const agents = agentsQuery.data ?? [];
-  const agentTrends = analytics?.agentTrends ?? [];
+  // Use agentSummaries from analytics (agentTrends doesn't exist in type)
+  const agentSummaries = analytics?.agentSummaries ?? [];
 
-  // Collect experiments for all agents
-  const agentIds = agents.map((a) => a.id);
-
-  function formatDuration(ms: number): string {
-    if (ms < 1000) return `${Math.round(ms)}ms`;
-    if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
-    return `${(ms / 60_000).toFixed(1)}m`;
+  function formatDuration(seconds: number): string {
+    if (seconds < 60) return `${Math.round(seconds)}s`;
+    if (seconds < 3600) return `${(seconds / 60).toFixed(1)}m`;
+    return `${(seconds / 3600).toFixed(1)}h`;
   }
 
   if (!companyId) return null;
@@ -177,7 +158,7 @@ export function Analytics() {
       {/* Agent Comparison */}
       <section>
         <h3 className="text-sm font-semibold mb-3">Agent Comparison</h3>
-        {agentTrends.length === 0 ? (
+        {agentSummaries.length === 0 ? (
           <EmptySection icon={BarChart3} message="No agent performance data available yet." />
         ) : (
           <div className="border border-border rounded-lg overflow-hidden">
@@ -198,15 +179,15 @@ export function Analytics() {
                 </tr>
               </thead>
               <tbody>
-                {agentTrends.map((trend) => (
-                  <tr key={trend.agentId} className="border-b border-border last:border-b-0">
-                    <td className="px-3 py-2 font-medium">{trend.agentName}</td>
+                {agentSummaries.map((summary) => (
+                  <tr key={summary.agentId} className="border-b border-border last:border-b-0">
+                    <td className="px-3 py-2 font-medium">{summary.agentName}</td>
                     <td className="px-3 py-2">
-                      {Math.round(trend.completionRate * 100)}%
+                      {Math.round(summary.completionRate * 100)}%
                     </td>
-                    <td className="px-3 py-2">{formatCents(Math.round(trend.avgCostCents))}</td>
-                    <td className="px-3 py-2">{formatDuration(trend.avgDurationMs)}</td>
-                    <td className="px-3 py-2">{trend.totalRuns}</td>
+                    <td className="px-3 py-2">{formatCents(Math.round(summary.avgCostCents))}</td>
+                    <td className="px-3 py-2">{formatDuration(summary.avgDurationSeconds)}</td>
+                    <td className="px-3 py-2">{summary.totalRuns}</td>
                   </tr>
                 ))}
               </tbody>
@@ -230,27 +211,28 @@ export function Analytics() {
         ) : (
           <div className="space-y-2">
             {observations.map((obs) => {
-              const agentName = obs.agentId
-                ? agents.find((a) => a.id === obs.agentId)?.name ?? "Unknown"
+              const agentNames = obs.agentIds.length > 0
+                ? obs.agentIds.map(id => agents.find(a => a.id === id)?.name ?? "Unknown").join(", ")
                 : "Company-wide";
               return (
                 <Card key={obs.id} className="p-3">
                   <div className="flex items-start justify-between gap-3">
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 mb-1 flex-wrap">
-                        <h4 className="text-sm font-medium truncate">{obs.title}</h4>
-                        <Badge
-                          variant="secondary"
-                          className={cn("text-[10px] px-1.5 py-0", severityColors[obs.severity])}
-                        >
-                          {obs.severity}
-                        </Badge>
                         <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
-                          {obs.observerType}
+                          {obs.observerType === "ceo_agent" ? "CEO" : "Board"}
                         </Badge>
-                        <span className="text-[10px] text-muted-foreground">{agentName}</span>
+                        {obs.actionTaken && (
+                          <Badge variant="secondary" className="text-[10px] px-1.5 py-0 bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300">
+                            Action Taken
+                          </Badge>
+                        )}
+                        <span className="text-[10px] text-muted-foreground">{agentNames}</span>
                       </div>
-                      <p className="text-xs text-muted-foreground line-clamp-2">{obs.content}</p>
+                      <p className="text-sm">{obs.observation}</p>
+                      {obs.actionNotes && (
+                        <p className="text-xs text-muted-foreground mt-1">Notes: {obs.actionNotes}</p>
+                      )}
                     </div>
                     <Button
                       size="sm"
@@ -291,39 +273,13 @@ export function Analytics() {
           </DialogHeader>
           <div className="space-y-4">
             <div>
-              <label className="text-xs font-medium text-muted-foreground">Title</label>
-              <Input
-                value={obsForm.title}
-                onChange={(e) => setObsForm({ ...obsForm, title: e.target.value })}
-                placeholder="Observation title"
-              />
-            </div>
-            <div>
-              <label className="text-xs font-medium text-muted-foreground">Content</label>
+              <label className="text-xs font-medium text-muted-foreground">Observation</label>
               <Textarea
-                value={obsForm.content}
-                onChange={(e) => setObsForm({ ...obsForm, content: e.target.value })}
-                placeholder="Describe the observation..."
-                rows={3}
+                value={obsForm.observation}
+                onChange={(e) => setObsForm({ observation: e.target.value })}
+                placeholder="Describe the observation about company-wide performance..."
+                rows={4}
               />
-            </div>
-            <div>
-              <label className="text-xs font-medium text-muted-foreground">Severity</label>
-              <Select
-                value={obsForm.severity}
-                onValueChange={(v) =>
-                  setObsForm({ ...obsForm, severity: v as "info" | "warning" | "critical" })
-                }
-              >
-                <SelectTrigger className="h-9">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="info">Info</SelectItem>
-                  <SelectItem value="warning">Warning</SelectItem>
-                  <SelectItem value="critical">Critical</SelectItem>
-                </SelectContent>
-              </Select>
             </div>
           </div>
           <DialogFooter>
@@ -333,12 +289,11 @@ export function Analytics() {
             <Button
               onClick={() =>
                 createObsMutation.mutate({
-                  title: obsForm.title,
-                  content: obsForm.content,
-                  severity: obsForm.severity,
+                  observerType: "board_human",
+                  observation: obsForm.observation,
                 })
               }
-              disabled={!obsForm.title.trim() || !obsForm.content.trim() || createObsMutation.isPending}
+              disabled={!obsForm.observation.trim() || createObsMutation.isPending}
             >
               {createObsMutation.isPending ? "Creating..." : "Create"}
             </Button>
@@ -397,7 +352,6 @@ function AgentExperimentsSection({
           <Card key={exp.id} className="p-3">
             <div className="flex items-center gap-2 mb-1">
               <FlaskConical className="h-3.5 w-3.5 text-muted-foreground" />
-              <h5 className="text-sm font-medium truncate">{exp.name}</h5>
               <Badge
                 variant="secondary"
                 className={cn(
@@ -407,15 +361,20 @@ function AgentExperimentsSection({
               >
                 {exp.status}
               </Badge>
+              {exp.winningApproach && (
+                <Badge variant="secondary" className="text-[10px] px-1.5 py-0 bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300">
+                  Winner: {exp.winningApproach}
+                </Badge>
+              )}
             </div>
-            {exp.description && (
-              <p className="text-xs text-muted-foreground line-clamp-1 ml-5">
-                {exp.description}
-              </p>
-            )}
-            {exp.result && (
-              <p className="text-xs text-green-600 dark:text-green-400 ml-5 mt-0.5 line-clamp-1">
-                Result: {exp.result}
+            <p className="text-sm font-medium ml-5">{exp.hypothesis}</p>
+            <div className="text-xs text-muted-foreground ml-5 mt-1 space-y-0.5">
+              <p><span className="font-medium">A:</span> {exp.approachA}</p>
+              <p><span className="font-medium">B:</span> {exp.approachB}</p>
+            </div>
+            {exp.changeNotes && (
+              <p className="text-xs text-green-600 dark:text-green-400 ml-5 mt-1">
+                Changes: {exp.changeNotes}
               </p>
             )}
           </Card>
